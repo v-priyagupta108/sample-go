@@ -39,7 +39,7 @@ jobs:
           cat > fixtures/godirective/go.mod <<'EOF'
           module example.com/godirective
 
-          go 1.25rc1
+          go 1.27rc1
           EOF
       - uses: actions/setup-go@v7
         id: setup

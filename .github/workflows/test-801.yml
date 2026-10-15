@@ -1,0 +1,75 @@
+name: Test setup-go archive availability (#801)
+
+on:
+  workflow_dispatch:
+  push:
+  
+permissions:
+  contents: read
+
+jobs:
+  # 1) Directly probe codeload for SHA- vs tag-addressed archives
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe codeload archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          echo "| Ref | SHA | tar.gz/<sha> | tar.gz/refs/tags/<tag> |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          fail=0
+          for t in v6.4.0 v6.5.0 v6 v7.0.0 v7; do
+            obj=$(gh api repos/actions/setup-go/git/ref/tags/$t --jq '.object.type + " " + .object.sha')
+            type=${obj%% *}; sha=${obj##* }
+            # dereference annotated tags to the commit
+            if [ "$type" = "tag" ]; then
+              sha=$(gh api repos/actions/setup-go/git/tags/$sha --jq .object.sha)
+            fi
+            s=$(curl -sSL -o /dev/null -w '%{http_code}' https://codeload.github.com/actions/setup-go/tar.gz/$sha)
+            g=$(curl -sSL -o /dev/null -w '%{http_code}' https://codeload.github.com/actions/setup-go/tar.gz/refs/tags/$t)
+            echo "$t ${sha:0:7} sha:$s tag:$g"
+            echo "| \`$t\` | \`${sha:0:7}\` | $s | $g |" >> "$GITHUB_STEP_SUMMARY"
+            [ "$s" = "200" ] || fail=1
+          done
+          echo "Probed at $(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
+          exit $fail
+
+  # 2) Actually resolve the action through the runner (fails in "Set up job" if broken)
+  use-action:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: stable
+      - run: go version
+
+  use-action-v7:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: stable
+      - run: go version
+
+  # 3) Control: known-good workaround pin (v6.4.0)
+  control-pinned:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: stable
+      - run: go version

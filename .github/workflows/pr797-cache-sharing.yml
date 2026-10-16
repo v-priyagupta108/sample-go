@@ -1,0 +1,252 @@
+name: PR 797 - module cache sharing & compatibility
+
+# Tests actions/setup-go#797 from the author's branch: the module entry is shared across
+# Go versions / architectures / Linux images on the same OS, while build entries stay separate.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/pr797-*.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SALT: ${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  # 1) Go version change: modules hit, build miss -> cache-hit=false, only build is saved
+  go125-populate:
+    name: go 1.25 populate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt version-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        with:
+          go-version: '1.25'
+      - run: go build ./...
+
+  go126-reuse-modules:
+    name: go 1.26 reuses modules (${{ matrix.os }})
+    needs: go125-populate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt version-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - name: Expect modules hit / build miss
+        run: |
+          echo "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          [ "${{ steps.setup.outputs.cache-hit }}" = "false" ]
+          GOPROXY=off go build ./...
+      # Post step: modules "not saving cache"; build saved
+
+  go126-warm:
+    name: go 1.26 warm (${{ matrix.os }})
+    needs: go126-reuse-modules
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt version-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - run: |
+          [ "${{ steps.setup.outputs.cache-hit }}" = "true" ]
+          GOPROXY=off go build ./...
+
+  # 2) Architecture change on the same OS (x64 -> arm64): modules shared, build separate
+  arch-populate:
+    name: arch populate (${{ matrix.from }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { from: ubuntu-24.04, to: ubuntu-24.04-arm }
+          - { from: macos-15-intel, to: macos-15 }
+          - { from: windows-2025, to: windows-11-arm }
+    runs-on: ${{ matrix.from }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt arch-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        with:
+          go-version: '1.26'
+      - run: go build ./...
+
+  arch-reuse:
+    name: arch reuse (${{ matrix.to }})
+    needs: arch-populate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { from: ubuntu-24.04, to: ubuntu-24.04-arm }
+          - { from: macos-15-intel, to: macos-15 }
+          - { from: windows-2025, to: windows-11-arm }
+    runs-on: ${{ matrix.to }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt arch-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - name: Expect modules hit / build miss
+        run: |
+          echo "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          [ "${{ steps.setup.outputs.cache-hit }}" = "false" ]
+          GOPROXY=off go build ./...
+
+  # 3) Linux image change (ubuntu-22.04 -> ubuntu-24.04): modules shared, build separate
+  image-populate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt image-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        with:
+          go-version: '1.26'
+      - run: go build ./...
+
+  image-reuse:
+    needs: image-populate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt image-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - run: |
+          [ "${{ steps.setup.outputs.cache-hit }}" = "false" ]
+          GOPROXY=off go build ./...
+
+  # 4) Different OS must NOT share modules (Linux cache -> Windows/macOS miss)
+  os-populate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt os-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        with:
+          go-version: '1.26'
+      - run: go build ./...
+
+  os-isolated:
+    name: os isolated (${{ matrix.os }})
+    needs: os-populate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt os-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - name: Expect modules miss
+        run: |
+          [ "${{ steps.setup.outputs.cache-hit }}" = "false" ]
+          ! GOPROXY=off go mod download 2>/dev/null
+
+  # 5) Old combined cache (released action) must NOT be restored by the new split keys
+  legacy-populate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt legacy-$SALT" >> go.mod
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0 (combined cache)
+        with:
+          go-version: '1.26'
+      - run: go build ./...
+
+  legacy-not-restored:
+    needs: legacy-populate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt legacy-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - run: |
+          [ "${{ steps.setup.outputs.cache-hit }}" = "false" ]
+          ! GOPROXY=off go mod download 2>/dev/null
+
+  # 6) Documented manual restore with actions/cache/restore and the new key formats
+  manual-populate:
+    name: manual populate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt manual-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        with:
+          go-version: '1.26'
+      - run: go build ./...
+
+  manual-restore:
+    name: manual restore (${{ matrix.os }})
+    needs: manual-populate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt manual-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup-go
+        with:
+          go-version: '1.26'
+          cache: false
+      - name: Compute cache variables (as in docs/advanced-usage.md)
+        run: |
+          echo "GO_MOD_CACHE=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
+          echo "GO_BUILD_CACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+          echo "ARCH=$(echo '${{ runner.arch }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Linux ]; then echo "CACHE_OS_SUFFIX=$ImageOS-" >> "$GITHUB_ENV"; fi
+      - uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.GO_MOD_CACHE }}
+          key: setup-go-modules-${{ runner.os }}-${{ hashFiles('go.mod') }}
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.GO_BUILD_CACHE }}
+          key: setup-go-build-${{ runner.os }}-${{ env.ARCH }}-${{ env.CACHE_OS_SUFFIX }}go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('go.mod') }}
+          fail-on-cache-miss: true
+      - run: GOPROXY=off go build ./...

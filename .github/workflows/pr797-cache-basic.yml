@@ -1,0 +1,145 @@
+name: PR 797 - split cache basics
+
+# Tests actions/setup-go#797 (split GOMODCACHE / GOCACHE entries) from the author's branch.
+# go.mod is salted with the run id so every run starts with cold caches.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/pr797-*.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SALT: ${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  # 1) Cold run: both entries miss -> cache-hit=false, post step saves BOTH entries
+  cold:
+    name: cold (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt basic-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - name: Assert cache-hit=false and modules not cached
+        run: |
+          echo "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          [ "${{ steps.setup.outputs.cache-hit }}" = "false" ]
+          ! GOPROXY=off go mod download 2>/dev/null
+      - run: go build ./...
+      # Post step should log "Cache saved with the key: setup-go-modules-..." and "...setup-go-build-..."
+
+  # 2) Warm run: both entries hit -> cache-hit=true, offline build works, post step saves NOTHING
+  warm:
+    name: warm (${{ matrix.os }})
+    needs: cold
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt basic-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - name: Assert cache-hit=true
+        run: |
+          echo "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          [ "${{ steps.setup.outputs.cache-hit }}" = "true" ]
+      - name: Offline build (modules must come from cache)
+        run: GOPROXY=off go build ./...
+      # Post step should log "Cache hit occurred on the primary key ..., not saving cache." twice
+
+  # 3) Partial save: GOCACHE removed before post -> modules still saved, build warns and is skipped
+  partial-populate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt partial-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        with:
+          go-version: '1.26'
+      - run: go mod download
+      - name: Delete GOCACHE so only the build entry fails to save
+        run: rm -rf "$(go env GOCACHE)"
+      # Post step: modules saved; "build cache folder doesn't exist on disk" warning
+
+  partial-restore:
+    needs: partial-populate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt partial-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+      - name: Assert modules hit but cache-hit=false (build missed)
+        run: |
+          echo "cache-hit=${{ steps.setup.outputs.cache-hit }}"
+          [ "${{ steps.setup.outputs.cache-hit }}" = "false" ]
+          GOPROXY=off go build ./...
+      # Post step: modules "not saving cache"; build saved
+
+  # 4) cache: false -> no restore/save at all
+  cache-disabled:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+          cache: false
+      - run: |
+          echo "cache-hit='${{ steps.setup.outputs.cache-hit }}'"
+          [ -z "${{ steps.setup.outputs.cache-hit }}" ] || [ "${{ steps.setup.outputs.cache-hit }}" = "false" ]
+          go build ./...
+
+  # 5) Custom cache-dependency-path (multiple files)
+  dep-path-populate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt deppath-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        with:
+          go-version: '1.26'
+          cache-dependency-path: |
+            go.mod
+            go.sum
+      - run: go build ./...
+
+  dep-path-restore:
+    needs: dep-path-populate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: echo "// salt deppath-$SALT" >> go.mod
+      - uses: actions/setup-go@feat/split-go-caches
+        id: setup
+        with:
+          go-version: '1.26'
+          cache-dependency-path: |
+            go.mod
+            go.sum
+      - run: |
+          [ "${{ steps.setup.outputs.cache-hit }}" = "true" ]
+          GOPROXY=off go build ./...
